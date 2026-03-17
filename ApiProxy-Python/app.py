@@ -16,6 +16,12 @@ parser.add_argument('-l', '--listen_host', default='127.0.0.1', help='Host to li
 parser.add_argument('-p', '--listen_port', default=8081, type=int, help='Port to listen on')
 parser.add_argument('-c', '--config', default='config.json', help='Config file')
 parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
+parser.add_argument(
+    '--trust-env',
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help='Trust environment and system proxy settings for upstream requests',
+)
 args = parser.parse_args()
 
 if args.debug:
@@ -25,8 +31,9 @@ with open(args.config, 'r') as f:
     config = json.load(f)
 
 
-def get_requests_session(prefix: str, max_concurrency: int) -> requests.Session:
+def get_requests_session(prefix: str, max_concurrency: int, trust_env: bool) -> requests.Session:
     session = requests.Session()
+    session.trust_env = trust_env
     if max_concurrency >= 1:
         adapter = HTTPAdapter(pool_connections=max_concurrency, pool_maxsize=max_concurrency)
         session.mount(prefix, adapter)
@@ -36,7 +43,11 @@ def get_requests_session(prefix: str, max_concurrency: int) -> requests.Session:
 endpoints = [{'endpoint': c['endpoint'],
               'semaphore': threading.Semaphore(c['max_concurrency']),
               'timeout': c['timeout'],
-              'session': get_requests_session(urlparse(c['endpoint']).scheme + '://', c['max_concurrency'])}
+              'session': get_requests_session(
+                  urlparse(c['endpoint']).scheme + '://',
+                  c['max_concurrency'],
+                  args.trust_env,
+              )}
              for c in config['endpoints']]
 endpoints_cycle = cycle(endpoints)
 
@@ -114,6 +125,25 @@ def get_response_headers(response: requests.Response):
     return [(key, value) for key, value in response.headers.items() if key.lower() not in HOP_BY_HOP_RESPONSE_HEADERS]
 
 
+def get_body_preview(body: bytes, limit: int = 300) -> str:
+    preview = body[:limit].decode('utf-8', errors='replace')
+    if len(body) > limit:
+        return f'{preview}...'
+    return preview
+
+
+def get_stream_flag(request_body: bytes):
+    try:
+        payload = json.loads(request_body.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    if isinstance(payload, dict):
+        return payload.get('stream')
+
+    return None
+
+
 def get_next_available_endpoint():
     for endpoint in endpoints_cycle:
         if endpoint['semaphore'].acquire(blocking=False):
@@ -122,39 +152,65 @@ def get_next_available_endpoint():
 
 
 def forward_request(request, endpoint):
+    request_body = request.get_data()
+    response = None
     try:
-        r = endpoint['session'].request(
+        app.logger.debug(
+            'Forwarding request method=%s path=%s upstream=%s stream=%s body_preview=%r',
+            request.method,
+            request.path,
+            endpoint['endpoint'],
+            get_stream_flag(request_body),
+            get_body_preview(request_body),
+        )
+
+        response = endpoint['session'].request(
             method=request.method,
             url=endpoint['endpoint'] + request.path[1:],
             headers={key: value for (key, value) in request.headers if key != 'Host'},
-            data=request.get_data(),
+            data=request_body,
             cookies=request.cookies,
             timeout=endpoint['timeout'],
             allow_redirects=False)
-        content_type = r.headers.get('Content-Type', '')
-        encoding = 'utf-8' if is_event_stream_content_type(content_type) else (r.encoding if r.encoding else 'utf-8')
-        app.logger.debug(f'Received response: {r.content.decode(encoding)}')
+        content_type = response.headers.get('Content-Type', '')
+        encoding = 'utf-8' if is_event_stream_content_type(content_type) else (response.encoding if response.encoding else 'utf-8')
+        response_text = response.content.decode(encoding)
+        app.logger.debug(
+            'Received upstream response status=%s content_type=%s encoding=%s body_preview=%r',
+            response.status_code,
+            content_type,
+            encoding,
+            response_text[:300],
+        )
 
         if opencc_enabled:
             json_ensure_ascii = False if encoding.lower() in ('utf-8', 'utf8') else True
 
             if is_json_content_type(content_type):
-                response_text = r.content.decode(encoding)
                 response_json = convert_response_json(json.loads(response_text))
                 response_text = json.dumps(response_json, ensure_ascii=json_ensure_ascii, separators=(',', ':'))
                 response_content = response_text.encode(encoding)
                 app.logger.debug(f'Converted response: {response_text}')
-                return response_content, r.status_code, get_response_headers(r)
+                return response_content, response.status_code, get_response_headers(response)
 
             if is_event_stream_content_type(content_type):
-                response_text = r.content.decode(encoding)
                 response_text = convert_event_stream_response(response_text, json_ensure_ascii)
                 response_content = response_text.encode(encoding)
                 app.logger.debug(f'Converted event stream response: {response_text}')
-                return response_content, r.status_code, get_response_headers(r)
+                return response_content, response.status_code, get_response_headers(response)
 
-        return r.content, r.status_code, get_response_headers(r)
+        return response.content, response.status_code, get_response_headers(response)
     except Exception as e:
+        app.logger.exception(
+            'Forward request failed method=%s path=%s upstream=%s upstream_status=%s upstream_content_type=%s body_preview=%r error=%s',
+            request.method,
+            request.path,
+            endpoint['endpoint'],
+            response.status_code if response is not None else None,
+            response.headers.get('Content-Type', '') if response is not None else None,
+            get_body_preview(request_body),
+            e,
+        )
         return str(e), 500
 
 
