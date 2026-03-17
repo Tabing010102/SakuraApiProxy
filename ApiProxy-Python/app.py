@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import threading
+import multiprocessing
 from itertools import cycle
 from urllib.parse import urlparse
 
@@ -46,6 +47,72 @@ if opencc_enabled:
 
 app = Flask(__name__)
 
+HOP_BY_HOP_RESPONSE_HEADERS = {
+    'connection',
+    'content-length',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'proxy-connection',
+    'te',
+    'trailers',
+    'transfer-encoding',
+    'upgrade',
+}
+
+
+def is_json_content_type(content_type: str) -> bool:
+    mime_type = content_type.split(';', 1)[0].strip().lower()
+    return mime_type == 'application/json' or mime_type.endswith('+json')
+
+
+def is_event_stream_content_type(content_type: str) -> bool:
+    return content_type.split(';', 1)[0].strip().lower() == 'text/event-stream'
+
+
+def convert_response_json(response_json: dict) -> dict:
+    for choice in response_json.get('choices', []):
+        message = choice.get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), str):
+            message['content'] = opencc_converter.convert(message['content'])
+
+        delta = choice.get('delta')
+        if isinstance(delta, dict) and isinstance(delta.get('content'), str):
+            delta['content'] = opencc_converter.convert(delta['content'])
+
+        if isinstance(choice.get('text'), str):
+            choice['text'] = opencc_converter.convert(choice['text'])
+
+    if isinstance(response_json.get('content'), str):
+        response_json['content'] = opencc_converter.convert(response_json['content'])
+
+    return response_json
+
+
+def convert_event_stream_response(response_text: str, json_ensure_ascii: bool) -> str:
+    converted_lines = []
+    for line in response_text.splitlines(keepends=True):
+        stripped_line = line.rstrip('\r\n')
+        line_ending = line[len(stripped_line):]
+
+        if stripped_line.startswith('data: '):
+            payload = stripped_line[6:]
+            if payload and payload != '[DONE]':
+                try:
+                    payload_json = convert_response_json(json.loads(payload))
+                    payload = json.dumps(payload_json, ensure_ascii=json_ensure_ascii, separators=(',', ':'))
+                    line = f'data: {payload}{line_ending}'
+                except json.JSONDecodeError:
+                    pass
+
+        converted_lines.append(line)
+
+    return ''.join(converted_lines)
+
+
+def get_response_headers(response: requests.Response):
+    return [(key, value) for key, value in response.headers.items() if key.lower() not in HOP_BY_HOP_RESPONSE_HEADERS]
+
 
 def get_next_available_endpoint():
     for endpoint in endpoints_cycle:
@@ -58,35 +125,35 @@ def forward_request(request, endpoint):
     try:
         r = endpoint['session'].request(
             method=request.method,
-            url=endpoint['endpoint'] + request.path,
+            url=endpoint['endpoint'] + request.path[1:],
             headers={key: value for (key, value) in request.headers if key != 'Host'},
             data=request.get_data(),
             cookies=request.cookies,
             timeout=endpoint['timeout'],
             allow_redirects=False)
-        encoding = r.encoding if r.encoding else 'utf-8'
+        content_type = r.headers.get('Content-Type', '')
+        encoding = 'utf-8' if is_event_stream_content_type(content_type) else (r.encoding if r.encoding else 'utf-8')
         app.logger.debug(f'Received response: {r.content.decode(encoding)}')
 
         if opencc_enabled:
-            if opencc_enabled:
-                json_ensure_ascii = False if (encoding == 'utf-8' or encoding == 'utf8') else True
+            json_ensure_ascii = False if encoding.lower() in ('utf-8', 'utf8') else True
+
+            if is_json_content_type(content_type):
                 response_text = r.content.decode(encoding)
-                response_json = json.loads(response_text)
-
-                # chat completion api
-                for choice in response_json.get('choices', []):
-                    if 'message' in choice and 'content' in choice['message']:
-                        choice['message']['content'] = opencc_converter.convert(choice['message']['content'])
-                # completion api
-                if 'content' in response_json:
-                    response_json['content'] = opencc_converter.convert(response_json['content'])
-
+                response_json = convert_response_json(json.loads(response_text))
                 response_text = json.dumps(response_json, ensure_ascii=json_ensure_ascii, separators=(',', ':'))
                 response_content = response_text.encode(encoding)
                 app.logger.debug(f'Converted response: {response_text}')
-                return response_content, r.status_code, r.raw.headers.items()
-        else:
-            return r.content, r.status_code, r.raw.headers.items()
+                return response_content, r.status_code, get_response_headers(r)
+
+            if is_event_stream_content_type(content_type):
+                response_text = r.content.decode(encoding)
+                response_text = convert_event_stream_response(response_text, json_ensure_ascii)
+                response_content = response_text.encode(encoding)
+                app.logger.debug(f'Converted event stream response: {response_text}')
+                return response_content, r.status_code, get_response_headers(r)
+
+        return r.content, r.status_code, get_response_headers(r)
     except Exception as e:
         return str(e), 500
 
@@ -106,4 +173,8 @@ def catch_all(path):
 
 
 if __name__ == '__main__':
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
     app.run(host=args.listen_host, port=args.listen_port)
